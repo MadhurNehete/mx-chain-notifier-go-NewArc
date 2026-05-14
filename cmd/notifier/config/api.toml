@@ -1,0 +1,20 @@
+# API routes configuration
+[APIPackages]
+
+[APIPackages.events]
+    Routes = [
+        { Name = "/push", Open = true, Auth = true },
+        { Name = "/revert", Open = true, Auth = true },
+        { Name = "/finalized", Open = true, Auth = true },
+    ]
+
+[APIPackages.hub]
+    Routes = [
+        { Name = "/ws", Open = true, Auth = true },
+    ]
+
+[APIPackages.status]
+    Routes = [
+        { Name = "/metrics", Open = true },
+        { Name = "/prometheus-metrics", Open = true },
+    ]

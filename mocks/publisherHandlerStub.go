@@ -1,0 +1,82 @@
+package mocks
+
+import "github.com/multiversx/mx-chain-notifier-go/data"
+
+// PublisherHandlerStub -
+type PublisherHandlerStub struct {
+	PublishCalled                     func(events data.BlockEvents)
+	PublishRevertCalled               func(revertBlock data.RevertBlock) error
+	PublishFinalizedCalled            func(finalizedBlock data.FinalizedBlock) error
+	PublishTxsCalled                  func(blockTxs data.BlockTxs)
+	PublishScrsCalled                 func(blockScrs data.BlockScrs)
+	PublishBlockEventsWithOrderCalled func(blockTxs data.BlockEventsWithOrder)
+	PublishBlockStateAccessesCalled   func(stateAccesses data.BlockStateAccesses)
+	CloseCalled                       func() error
+}
+
+// Publish -
+func (p *PublisherHandlerStub) Publish(events data.BlockEvents) {
+	if p.PublishCalled != nil {
+		p.PublishCalled(events)
+	}
+}
+
+// PublishRevert -
+func (p *PublisherHandlerStub) PublishRevert(revertBlock data.RevertBlock) error {
+	if p.PublishRevertCalled != nil {
+		return p.PublishRevertCalled(revertBlock)
+	}
+
+	return nil
+}
+
+// PublishFinalized -
+func (p *PublisherHandlerStub) PublishFinalized(finalizedBlock data.FinalizedBlock) error {
+	if p.PublishFinalizedCalled != nil {
+		return p.PublishFinalizedCalled(finalizedBlock)
+	}
+
+	return nil
+}
+
+// PublishTxs -
+func (p *PublisherHandlerStub) PublishTxs(blockTxs data.BlockTxs) {
+	if p.PublishTxsCalled != nil {
+		p.PublishTxsCalled(blockTxs)
+	}
+}
+
+// PublishScrs -
+func (p *PublisherHandlerStub) PublishScrs(blockScrs data.BlockScrs) {
+	if p.PublishScrsCalled != nil {
+		p.PublishScrsCalled(blockScrs)
+	}
+}
+
+// PublishBlockEventsWithOrder -
+func (p *PublisherHandlerStub) PublishBlockEventsWithOrder(blockTxs data.BlockEventsWithOrder) {
+	if p.PublishBlockEventsWithOrderCalled != nil {
+		p.PublishBlockEventsWithOrderCalled(blockTxs)
+	}
+}
+
+// PublishStateAccesses -
+func (p *PublisherHandlerStub) PublishStateAccesses(stateAccesses data.BlockStateAccesses) {
+	if p.PublishBlockStateAccessesCalled != nil {
+		p.PublishBlockStateAccessesCalled(stateAccesses)
+	}
+}
+
+// Close -
+func (p *PublisherHandlerStub) Close() error {
+	if p.CloseCalled != nil {
+		return p.CloseCalled()
+	}
+
+	return nil
+}
+
+// IsInterfaceNil -
+func (p *PublisherHandlerStub) IsInterfaceNil() bool {
+	return p == nil
+}

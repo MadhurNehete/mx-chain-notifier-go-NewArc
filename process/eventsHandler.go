@@ -1,0 +1,453 @@
+package process
+
+import (
+	"context"
+	"encoding/hex"
+	"fmt"
+	"time"
+
+	"github.com/multiversx/mx-chain-core-go/core/check"
+	logger "github.com/multiversx/mx-chain-logger-go"
+	"github.com/multiversx/mx-chain-notifier-go/common"
+	"github.com/multiversx/mx-chain-notifier-go/data"
+)
+
+var log = logger.GetOrCreate("process")
+
+const (
+	setRetryDuration         = time.Millisecond * 500
+	reconnectRetryDuration   = time.Second * 2
+	minRetries               = 1
+	maxCheckProcessedRetries = 3
+	revertKeyPrefix          = "revert_"
+	finalizedKeyPrefix       = "finalized_"
+
+	rabbitmqMetricPrefix = "RabbitMQ"
+	redisMetricPrefix    = "Redis"
+)
+
+var retrySleep = time.Sleep
+
+// ArgsEventsHandler defines the arguments needed for an events handler
+type ArgsEventsHandler struct {
+	Locker               LockService
+	Publisher            Publisher
+	StatusMetricsHandler common.StatusMetricsHandler
+	EventsInterceptor    EventsInterceptor
+	CheckDuplicates      bool
+}
+
+type eventsHandler struct {
+	locker            LockService
+	publisher         Publisher
+	metricsHandler    common.StatusMetricsHandler
+	eventsInterceptor EventsInterceptor
+	checkDuplicates   bool
+}
+
+// NewEventsHandler creates a new events handler component
+func NewEventsHandler(args ArgsEventsHandler) (*eventsHandler, error) {
+	err := checkArgs(args)
+	if err != nil {
+		return nil, err
+	}
+
+	return &eventsHandler{
+		locker:            args.Locker,
+		publisher:         args.Publisher,
+		metricsHandler:    args.StatusMetricsHandler,
+		eventsInterceptor: args.EventsInterceptor,
+		checkDuplicates:   args.CheckDuplicates,
+	}, nil
+}
+
+func checkArgs(args ArgsEventsHandler) error {
+	if check.IfNil(args.Locker) {
+		return ErrNilLockService
+	}
+	if check.IfNil(args.Publisher) {
+		return ErrNilPublisherService
+	}
+	if check.IfNil(args.StatusMetricsHandler) {
+		return common.ErrNilStatusMetricsHandler
+	}
+	if check.IfNil(args.EventsInterceptor) {
+		return ErrNilEventsInterceptor
+	}
+
+	return nil
+}
+
+// HandleSaveBlockEvents will handle save block events received from observer
+func (eh *eventsHandler) HandleSaveBlockEvents(allEvents data.ArgsSaveBlockData) error {
+	blockHash := hex.EncodeToString(allEvents.HeaderHash)
+	shouldProcessPushEvents := eh.shouldProcessSaveBlockEvents(blockHash)
+	if !shouldProcessPushEvents {
+		return nil
+	}
+
+	if check.IfNil(allEvents.Header) {
+		return ErrNilBlockHeader
+	}
+
+	if allEvents.Header.IsHeaderV3() {
+		return eh.handleSaveBlockEventsV3(allEvents)
+	}
+
+	return eh.handleSaveBlockEventsLegacy(allEvents)
+}
+
+func (eh *eventsHandler) handleSaveBlockEventsLegacy(allEvents data.ArgsSaveBlockData) error {
+	eventsData, err := eh.eventsInterceptor.ProcessBlockEvents(&allEvents)
+	if err != nil {
+		return err
+	}
+
+	headerTimeStamp := eventsData.Header.GetTimeStamp()
+	headerTimeStampMs := allEvents.HeaderTimeStampMs
+	shardID := eventsData.Header.GetShardID()
+	nonce := eventsData.Header.GetNonce()
+
+	return eh.handleSaveBlockEvents(
+		eventsData,
+		headerTimeStamp,
+		headerTimeStampMs,
+		shardID,
+		nonce,
+	)
+}
+
+func (eh *eventsHandler) handleSaveBlockEvents(
+	eventsData *data.InterceptorBlockData,
+	headerTimeStamp uint64,
+	headerTimeStampMs uint64,
+	shardID uint32,
+	nonce uint64,
+) error {
+	if eventsData == nil {
+		return ErrNilEventsInterceptor
+	}
+	if check.IfNil(eventsData.Header) {
+		return ErrNilBlockHeader
+	}
+
+	pushEvents := data.BlockEvents{
+		Hash:        eventsData.Hash,
+		ShardID:     shardID,
+		TimeStamp:   headerTimeStamp,
+		TimeStampMs: headerTimeStampMs,
+		Events:      eventsData.LogEvents,
+	}
+	err := eh.handlePushEvents(pushEvents)
+	if err != nil {
+		return err
+	}
+
+	txs := data.BlockTxs{
+		Hash: eventsData.Hash,
+		Txs:  eventsData.Txs,
+	}
+	eh.handleBlockTxs(txs)
+
+	scrs := data.BlockScrs{
+		Hash: eventsData.Hash,
+		Scrs: eventsData.Scrs,
+	}
+	eh.handleBlockScrs(scrs)
+
+	txsWithOrder := data.BlockEventsWithOrder{
+		Hash:        eventsData.Hash,
+		ShardID:     shardID,
+		TimeStamp:   headerTimeStamp,
+		TimeStampMs: headerTimeStampMs,
+		Txs:         eventsData.TxsWithOrder,
+		Scrs:        eventsData.ScrsWithOrder,
+		Events:      eventsData.LogEvents,
+	}
+	eh.handleBlockEventsWithOrder(txsWithOrder)
+
+	stateAccesses := data.BlockStateAccesses{
+		Hash:                     eventsData.Hash,
+		ShardID:                  shardID,
+		TimeStampMs:              headerTimeStampMs,
+		Nonce:                    nonce,
+		StateAccessesPerAccounts: eventsData.StateAccessesPerAccounts,
+	}
+	eh.handleStateAccesses(stateAccesses)
+
+	return nil
+}
+
+func (eh *eventsHandler) handleSaveBlockEventsV3(allEvents data.ArgsSaveBlockData) error {
+	executionResultsData, err := eh.eventsInterceptor.ProcessBlockEventsV3(&allEvents)
+	if err != nil {
+		return err
+	}
+
+	shardID := allEvents.Header.GetShardID()
+
+	for _, executionResultData := range executionResultsData {
+		timeStampSec := common.ConvertTimeStampMsToSec(executionResultData.TimeStampMs) // this is used for backwards compatibility
+		err = eh.handleSaveBlockEvents(
+			executionResultData,
+			timeStampSec,
+			executionResultData.TimeStampMs,
+			shardID,
+			executionResultData.Nonce,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// HandlePushEvents will handle push events received from observer
+func (eh *eventsHandler) handlePushEvents(events data.BlockEvents) error {
+	if events.Hash == "" {
+		log.Debug("received empty hash", "event", common.PushLogsAndEvents,
+			"will process", false,
+		)
+		return common.ErrReceivedEmptyEvents
+	}
+
+	if len(events.Events) == 0 {
+		log.Debug("received empty events", "event", common.PushLogsAndEvents,
+			"block hash", events.Hash,
+		)
+		events.Events = make([]data.Event, 0)
+	} else {
+		log.Info("received", "event", common.PushLogsAndEvents,
+			"block hash", events.Hash,
+		)
+	}
+
+	t := time.Now()
+	eh.publisher.Broadcast(events)
+	eh.metricsHandler.AddRequest(getRabbitOpID(common.PushLogsAndEvents), time.Since(t))
+	return nil
+}
+
+func (eh *eventsHandler) shouldProcessSaveBlockEvents(blockHash string) bool {
+	shouldProcessEvents := true
+	if eh.checkDuplicates {
+		shouldProcessEvents = eh.tryCheckProcessedWithRetry(common.PushLogsAndEvents, blockHash)
+	}
+
+	if !shouldProcessEvents {
+		log.Info("received duplicated push events",
+			"block hash", blockHash,
+			"will process", false,
+		)
+
+		return false
+	}
+
+	return true
+}
+
+// HandleRevertEvents will handle revents events received from observer
+func (eh *eventsHandler) HandleRevertEvents(revertBlock data.RevertBlock) error {
+	if revertBlock.Hash == "" {
+		log.Warn("received empty hash", "event", common.RevertBlockEvents,
+			"will process", false,
+		)
+		return common.ErrReceivedEmptyEvents
+	}
+
+	shouldProcessRevert := true
+	if eh.checkDuplicates {
+		shouldProcessRevert = eh.tryCheckProcessedWithRetry(common.RevertBlockEvents, revertBlock.Hash)
+	}
+
+	if !shouldProcessRevert {
+		log.Info("received duplicated events", "event", common.RevertBlockEvents,
+			"block hash", revertBlock.Hash,
+			"will process", false,
+		)
+		return nil
+	}
+
+	log.Info("received", "event", common.RevertBlockEvents,
+		"block hash", revertBlock.Hash,
+		"will process", shouldProcessRevert,
+	)
+
+	t := time.Now()
+	err := eh.publisher.BroadcastRevert(revertBlock)
+	eh.metricsHandler.AddRequest(getRabbitOpID(common.RevertBlockEvents), time.Since(t))
+	return err
+}
+
+// HandleFinalizedEvents will handle finalized events received from observer
+func (eh *eventsHandler) HandleFinalizedEvents(finalizedBlock data.FinalizedBlock) error {
+	if finalizedBlock.Hash == "" {
+		log.Warn("received empty hash", "event", common.FinalizedBlockEvents,
+			"will process", false,
+		)
+		return common.ErrReceivedEmptyEvents
+	}
+	shouldProcessFinalized := true
+	if eh.checkDuplicates {
+		shouldProcessFinalized = eh.tryCheckProcessedWithRetry(common.FinalizedBlockEvents, finalizedBlock.Hash)
+	}
+
+	if !shouldProcessFinalized {
+		log.Info("received duplicated events", "event", common.FinalizedBlockEvents,
+			"block hash", finalizedBlock.Hash,
+			"will process", false,
+		)
+		return nil
+	}
+
+	log.Info("received", "event", common.FinalizedBlockEvents,
+		"block hash", finalizedBlock.Hash,
+		"will process", shouldProcessFinalized,
+	)
+
+	t := time.Now()
+	err := eh.publisher.BroadcastFinalized(finalizedBlock)
+	eh.metricsHandler.AddRequest(getRabbitOpID(common.FinalizedBlockEvents), time.Since(t))
+	return err
+}
+
+// handleBlockTxs will handle txs events received from observer
+func (eh *eventsHandler) handleBlockTxs(blockTxs data.BlockTxs) {
+	if blockTxs.Hash == "" {
+		log.Warn("received empty hash", "event", common.BlockTxs,
+			"will process", false,
+		)
+		return
+	}
+
+	if len(blockTxs.Txs) == 0 {
+		log.Debug("received empty events", "event", common.BlockTxs,
+			"block hash", blockTxs.Hash,
+		)
+	} else {
+		log.Info("received", "event", common.BlockTxs,
+			"block hash", blockTxs.Hash,
+		)
+	}
+
+	t := time.Now()
+	eh.publisher.BroadcastTxs(blockTxs)
+	eh.metricsHandler.AddRequest(getRabbitOpID(common.BlockTxs), time.Since(t))
+}
+
+// handleBlockScrs will handle scrs events received from observer
+func (eh *eventsHandler) handleBlockScrs(blockScrs data.BlockScrs) {
+	if blockScrs.Hash == "" {
+		log.Warn("received empty hash", "event", common.BlockScrs,
+			"will process", false,
+		)
+		return
+	}
+
+	if len(blockScrs.Scrs) == 0 {
+		log.Debug("received empty events", "event", common.BlockScrs,
+			"block hash", blockScrs.Hash,
+		)
+	} else {
+		log.Info("received", "event", common.BlockScrs,
+			"block hash", blockScrs.Hash,
+		)
+	}
+
+	t := time.Now()
+	eh.publisher.BroadcastScrs(blockScrs)
+	eh.metricsHandler.AddRequest(getRabbitOpID(common.BlockScrs), time.Since(t))
+}
+
+// handleBlockEventsWithOrder will handle full block events received from observer
+func (eh *eventsHandler) handleBlockEventsWithOrder(blockTxs data.BlockEventsWithOrder) {
+	if blockTxs.Hash == "" {
+		log.Warn("received empty hash", "event", common.BlockEvents,
+			"will process", false,
+		)
+		return
+	}
+
+	log.Info("received", "event", common.BlockEvents,
+		"block hash", blockTxs.Hash,
+	)
+
+	t := time.Now()
+	eh.publisher.BroadcastBlockEventsWithOrder(blockTxs)
+	eh.metricsHandler.AddRequest(getRabbitOpID(common.BlockEvents), time.Since(t))
+}
+
+func (eh *eventsHandler) handleStateAccesses(stateAccesses data.BlockStateAccesses) {
+	if stateAccesses.Hash == "" {
+		log.Warn("received empty state accesses",
+			"will process", false,
+		)
+		return
+	}
+
+	log.Info("received state accesses",
+		"block hash", stateAccesses.Hash,
+		"nonce", stateAccesses.Nonce,
+		"stateAccesesPerAccounts num", len(stateAccesses.StateAccessesPerAccounts),
+	)
+
+	t := time.Now()
+	eh.publisher.BroadcastStateAccesses(stateAccesses)
+	eh.metricsHandler.AddRequest(getRabbitOpID(common.BlockStateAccesses), time.Since(t))
+}
+
+func (eh *eventsHandler) tryCheckProcessedWithRetry(id, blockHash string) bool {
+	prefix := getPrefixLockerKey(id)
+	key := prefix + blockHash
+
+	for retries := 0; retries < maxCheckProcessedRetries; retries++ {
+		t := time.Now()
+		setSuccessful, err := eh.locker.IsEventProcessed(context.Background(), key)
+		eh.metricsHandler.AddRequest(getRedisOpID(id), time.Since(t))
+
+		if err == nil {
+			log.Debug("locker", "event", id, "block hash", blockHash, "succeeded", setSuccessful)
+			return setSuccessful
+		}
+
+		log.Error("failed to check event in locker", "error", err.Error())
+		if !eh.locker.HasConnection(context.Background()) {
+			log.Error("failure connecting to locker service")
+
+			retrySleep(reconnectRetryDuration)
+		} else {
+			retrySleep(setRetryDuration)
+		}
+	}
+
+	log.Error("locker retry budget exhausted", "event", id, "block hash", blockHash, "retries", maxCheckProcessedRetries)
+	return true
+}
+
+func getPrefixLockerKey(id string) string {
+	// keep this matching for backwards compatibility
+	switch id {
+	case common.PushLogsAndEvents:
+		return ""
+	case common.RevertBlockEvents:
+		return revertKeyPrefix
+	case common.FinalizedBlockEvents:
+		return finalizedKeyPrefix
+	}
+
+	return ""
+}
+
+func getRabbitOpID(operation string) string {
+	return fmt.Sprintf("%s-%s", rabbitmqMetricPrefix, operation)
+}
+
+func getRedisOpID(operation string) string {
+	return fmt.Sprintf("%s-%s", redisMetricPrefix, operation)
+}
+
+// IsInterfaceNil returns true if there is no value under the interface
+func (eh *eventsHandler) IsInterfaceNil() bool {
+	return eh == nil
+}
